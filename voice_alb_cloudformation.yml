@@ -1,0 +1,570 @@
+Description: "this template deploy singtel voice channel alb on given public subnets and configure launch templates for external access"
+Parameters:
+  InstanceTypeApplication:
+    Description: Allowed instance types for Application
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.medium
+      - t2.large
+      - t2.xlarge
+    ConstraintDescription: must be a valid ec2 instance type
+  InstanceTypeProxy:
+    Description: Allowed instance types for Proxy
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+    ConstraintDescription: must be a valid ec2 instance type
+  KeyName:
+    Description: The EC2 Key Pair to allow SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: "0.0.0.0/0"
+  SubDomain:
+    Description: subdomain Name
+    Type: String
+    MinLength: 3
+    MaxLength: 11
+    Default: test
+  HostedZone:
+    Description: HostedZone Name
+    #AllowedPattern: '(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}'
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)[^\\.]$
+    Type: String
+    Default: cicd.tetherfi.cloud
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: security groups from applications side/ this can be refer directly from output
+Mappings:
+  AWSInstanceType2Arch:
+    t2.micro:
+      Arch: HVM64
+    t2.small:
+      Arch: HVM64
+    t2.medium:
+      Arch: HVM64
+    t2.large:
+      Arch: HVM64
+    t2.xlarge:
+      Arch: HVM64
+    a1.medium:
+      Arch: HVM64
+    a2.large:
+      Arch: HVM64
+    a3.xlarge:
+      Arch: HVM64
+  AWSRegionArch2ApplicationAMI:
+    us-east-1:
+      HVM64: ami-0894aa438516f3dda
+  AWSRegionArch2ProxyAMI:
+    us-east-1:
+      HVM64: ami-0ccc7f597bd32a364
+Resources:
+  ApplicationScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !ImportValue PrivateSubnet1
+        - !ImportValue PrivateSubnet2
+      LaunchConfigurationName: !Ref ApplicationLaunchConfig
+      MaxSize: 2
+      MinSize: 1
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref ApplicationTargetGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        WillReplace: true
+  ApplicationLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      Comment: Launch Application server
+      AWS::CloudFormation::Init:
+        configSets:
+          setup:
+            - "installAwsCli"
+            - "downloadPSScripts"
+            - "envVariables"
+            - "downloadConfigs"
+            - "configChanges"
+            - "downloadRestartScript"
+            - "execRestartService"
+        installAwsCli:
+          packages:
+            msi:
+              awscli: "https://awscli.amazonaws.com/AWSCLIV2.msi"
+        downloadPSScripts:
+          sources:
+            c:/Tetherfi/Configs: "https://tetherfi-latest-builds.s3.amazonaws.com/TetherfiHome/env_setup.zip"
+        envVariables:
+          commands:
+            envScript:
+              command: "powershell.exe -File c://Tetherfi/Configs/env_setup.ps1"
+        downloadConfigs:
+          sources:
+            c:/Tetherfi/Configs: "https://tetherfi-latest-builds.s3.amazonaws.com/TetherfiHome/Singtel_Configs_06_10_2021_old.zip"
+        configChanges:
+          commands:
+            changeScript:
+              command: "powershell.exe Copy-Item -Path \"C:\\Tetherfi\\Configs\\*\" -Destination \"C:\\Tetherfi\\TetherfiHome\" -Recurse -force"
+        downloadRestartScript:
+          sources:
+            c:/Tetherfi/Configs: "https://tetherfi-latest-builds.s3.amazonaws.com/TetherfiHome/check_service_start.zip"
+        execRestartService:
+          commands:
+            restartScript:
+              command: "powershell.exe -File c://Tetherfi/Configs/check_service_start.ps1"
+    Properties:
+      KeyName: !Ref KeyName
+      ImageId:
+        !FindInMap [
+          AWSRegionArch2ApplicationAMI,
+          !Ref "AWS::Region",
+          !FindInMap [
+            AWSInstanceType2Arch,
+            !Ref "InstanceTypeApplication",
+            Arch,
+          ],
+        ]
+      InstanceType: !Ref InstanceTypeApplication
+      IamInstanceProfile: !ImportValue RootInstanceProfile
+      SecurityGroups:
+        - !Ref ApplicationSecurityGroup
+      UserData:
+        Fn::Base64:
+          !Join [
+            "",
+            [
+              "<powershell>\n",
+              "cfn-init.exe -v -c setup -s ",
+              { "Ref": "AWS::StackId" },
+              " -r ApplicationLaunchConfig --region ",
+              { "Ref": "AWS::Region" },
+              "\n",
+              "</powershell>",
+            ],
+          ]
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !ImportValue VPC
+      GroupDescription: Enable HTTP/HTTPS access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref SSHLocation
+ # Proxy scaling group
+  ProxyScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !ImportValue PrivateSubnet1
+        - !ImportValue PrivateSubnet2
+      LaunchConfigurationName: !Ref ProxyLaunchConfig
+      MaxSize: 2
+      MinSize: 1
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref ProxyTargetGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        WillReplace: true
+  ProxyLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      Comment: Launch Proxy server
+    Properties:
+      KeyName: !Ref KeyName
+      ImageId:
+        !FindInMap [
+          AWSRegionArch2ProxyAMI,
+          !Ref "AWS::Region",
+          !FindInMap [AWSInstanceType2Arch, !Ref "InstanceTypeProxy", Arch],
+        ]
+      InstanceType: !Ref InstanceTypeProxy
+      SecurityGroups:
+        - !Ref ProxySecurityGroup
+  ProxySecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: !ImportValue VPC
+      GroupDescription: Enable SSH access and HTTP from the load balancer only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: !Ref SSHLocation
+          FromPort: 22
+          ToPort: 22
+  ProxySecurityGroupIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !GetAtt [ProxySecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !GetAtt [ALBSecurityGroup, GroupId]
+  ProxyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !ImportValue VPC
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckPort: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200,202,302,404,403,401"
+        
+  # UI Scaling group 
+  UIScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !ImportValue PrivateSubnet1
+        - !ImportValue PrivateSubnet2
+      LaunchConfigurationName: !Ref UILaunchConfig
+      MaxSize: 2
+      MinSize: 1
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref UITargetGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        WillReplace: true
+  UILaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      Comment: Launch UI server
+    Properties:
+      KeyName: !Ref KeyName
+      ImageId:
+        !FindInMap [
+          AWSRegionArch2ApplicationAMI,
+          !Ref "AWS::Region",
+          !FindInMap [AWSInstanceType2Arch, !Ref "InstanceTypeApplication", Arch],
+        ]
+      InstanceType: !Ref InstanceTypeApplication
+      SecurityGroups:
+        - !Ref UISecurityGroup
+  UISecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: !ImportValue VPC
+      GroupDescription: Enable SSH access and HTTP from the load balancer only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: !Ref SSHLocation
+          FromPort: 22
+          ToPort: 22
+  UISecurityGroupIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !GetAtt [UISecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !GetAtt [ALBSecurityGroup, GroupId]
+  UITargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !ImportValue VPC
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckPort: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200,202,302,404,403,401"
+ # Tmac Scaling group 
+  TmacScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !ImportValue PrivateSubnet1
+        - !ImportValue PrivateSubnet2
+      LaunchConfigurationName: !Ref TmacLaunchConfig
+      MaxSize: 2
+      MinSize: 1
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref TmacTargetGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        WillReplace: true
+  TmacLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      Comment: Launch Tmac server
+    Properties:
+      KeyName: !Ref KeyName
+      ImageId:
+        !FindInMap [
+          AWSRegionArch2ApplicationAMI,
+          !Ref "AWS::Region",
+          !FindInMap [AWSInstanceType2Arch, !Ref "InstanceTypeApplication", Arch],
+        ]
+      InstanceType: !Ref InstanceTypeApplication
+      SecurityGroups:
+        - !Ref TmacSecurityGroup
+  TmacSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: !ImportValue VPC
+      GroupDescription: Enable SSH access and HTTP from the load balancer only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: !Ref SSHLocation
+          FromPort: 22
+          ToPort: 22
+  TmacSecurityGroupIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !GetAtt [TmacSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !GetAtt [ALBSecurityGroup, GroupId]
+  TmacTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !ImportValue VPC
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckPort: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200,202,302,404,403,401"
+   # Tmc Scaling group 
+  TmcScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !ImportValue PrivateSubnet1
+        - !ImportValue PrivateSubnet2
+      LaunchConfigurationName: !Ref TmcLaunchConfig
+      MaxSize: 2
+      MinSize: 1
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref TmcTargetGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        WillReplace: true
+  TmcLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      Comment: Launch Tmc server
+    Properties:
+      KeyName: !Ref KeyName
+      ImageId:
+        !FindInMap [
+          AWSRegionArch2ApplicationAMI,
+          !Ref "AWS::Region",
+          !FindInMap [AWSInstanceType2Arch, !Ref "InstanceTypeApplication", Arch],
+        ]
+      InstanceType: !Ref InstanceTypeApplication
+      SecurityGroups:
+        - !Ref TmcSecurityGroup
+  TmcSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: !ImportValue VPC
+      GroupDescription: Enable SSH access and HTTP from the load balancer only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: !Ref SSHLocation
+          FromPort: 22
+          ToPort: 22
+  TmcSecurityGroupIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !GetAtt [TmcSecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !GetAtt [ALBSecurityGroup, GroupId]
+  TmcTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !ImportValue VPC
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckPort: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200,202,302,404,403,401"
+        
+ # ElasticALB and Listener
+
+  
+  ElasticALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !ImportValue PublicSubnet1
+        - !ImportValue PublicSubnet2
+      Type: application
+      
+# ElasticALB Listener 
+  
+  ElasticALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ElasticALB
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ApplicationTargetGroup
+      Port: 80
+      Protocol: HTTP
+      
+  ElasticALBProxyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ElasticALB
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ProxyTargetGroup
+      Port: 8080
+      Protocol: HTTP
+      
+  UIListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ElasticALB
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref UITargetGroup
+      Port: 45000
+      Protocol: HTTP
+      
+  TmacListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ElasticALB
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TmacTargetGroup
+      Port: 45001
+      Protocol: HTTP
+      
+  TmcListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ElasticALB
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TmcTargetGroup
+      Port: 45002
+      Protocol: HTTP
+  
+  ApplicationTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !ImportValue VPC
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckPort: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200,202,302,404,403,401"
+  # ApplicationSecurityGroup:
+  #   Type: "AWS::EC2::SecurityGroup"
+  #   Properties:
+  #     VpcId: !ImportValue VPC
+  #     GroupDescription: Enable SSH access and HTTP from the load balancer only
+  #     SecurityGroupIngress:
+  #       - IpProtocol: tcp
+  #         CidrIp: !Ref SSHLocation
+  #         FromPort: 22
+  #         ToPort: 22
+ 
+        
+  ApplicationALBSecurityGroupIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref ApplicationSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !GetAtt [ALBSecurityGroup, GroupId]
+  ApplicationProxySecurityGroupIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref ApplicationSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !GetAtt [ProxySecurityGroup, GroupId]
+  # ALBRoute53RecordSet:
+  #   Type: "AWS::Route53::RecordSet"
+  #   Properties:
+  #     AliasTarget:
+  #       DNSName: !GetAtt [ElasticALB, DNSName]
+  #       EvaluateTargetHealth: true
+  #       HostedZoneId: !GetAtt [ElasticALB, CanonicalHostedZoneID]
+  #     HostedZoneName: !Join ["", [!Ref HostedZone, .]]
+  #     Comment: "A record for tmac frontend."
+  #     Name: !Join [".", [!Ref SubDomain, !Ref HostedZone, .]]
+  #     Type: A
+
+  ALBRoute53RecordSetGroup:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Join ["", [!Ref HostedZone, .]]
+      Comment: Zone apex alias targeted to myELB LoadBalancer.
+      RecordSets:
+        - Name: !Join [".", [!Ref SubDomain, !Ref HostedZone]]
+          Type: A
+          AliasTarget:
+            HostedZoneId: !GetAtt [ElasticALB, CanonicalHostedZoneID]
+            DNSName: !GetAtt [ElasticALB, DNSName]
+
+Outputs:
+  URL:
+    Description: "URL of the load balancer"
+    Value: !Join ["", ["http://", !GetAtt [ElasticALB, DNSName]]]
+  DNS:
+    Description: "DNS of the load balancer"
+    Value: !Ref ALBRoute53RecordSetGroup

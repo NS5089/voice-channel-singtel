@@ -1,0 +1,141 @@
+Description: Create RDS for Microsoft MYSQL Server
+Parameters:
+  DBInstanceClass:
+    Description: Allowed instance types for RDS
+    Type: String
+    Default: db.t2.medium
+    AllowedValues:
+      - db.t2.small
+      - db.t2.large
+      - db.t2.medium
+      - db.t2.xlarge
+      - db.t3.small
+      - db.t3.large
+      - db.t3.xlarge
+    ConstraintDescription: must be a valid db instance type
+  Engine:
+    Description: Allowed engine type for RDS
+    Type: String
+    Default: MySQL
+    ConstraintDescription: must be a valid db engine type
+  EngineVersion:
+    Description: Allowed engine type for RDS
+    Type: String
+    Default: 8.0.25
+    AllowedValues:
+      - 8.0.25
+      - 8.0.23
+      - 8.0.21
+      - 8.0.20
+
+    ConstraintDescription: must be a valid db engine type
+  SubDomain:
+    Description: subdomain Name
+    Type: String
+    MinLength: 3
+    MaxLength: 10
+    Default: mysql-rds
+  HostedZone:
+    Description: HostedZone Name
+    #AllowedPattern: '(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}'
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)[^\\.]$
+    Type: String
+    Default: internal.svc.local
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: security groups from applications side/ this can be refer directly from output
+Resources:
+    
+        
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      VPCSecurityGroups:
+        - !GetAtt DBEC2SecurityGroup.GroupId
+      AllocatedStorage: 20
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: !Ref Engine
+      EngineVersion: !Ref EngineVersion
+      DBParameterGroupName: !Ref RDSDBParameterGroup
+      #Here RDS secret username and password will pick it up 
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSInstanceSecret, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSInstanceSecret, ':SecretString:password}}' ]]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: true
+      BackupRetentionPeriod: 0
+      
+ # This is an RDS mysql parameter group mentioned below      
+  RDSDBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: CloudFormation Sample MySQL Parameter Group
+      Family: mysql8.0
+      Parameters:
+        max_binlog_cache_size: LEAST({DBInstanceClassMemory/256},3276899)
+        bulk_insert_buffer_size: 100000
+        log_bin_trust_function_creators: 1
+        lower_case_table_names: 0
+        max_allowed_packet: 1073741
+        time_zone: Asia/Singapore
+      
+  #This is a SecretTargetAttachment resource which updates the referenced Secret resource with properties about
+  #the referenced RDS instance
+  SecretRDSInstanceAttachment:
+    Type: "AWS::SecretsManager::SecretTargetAttachment"
+    Properties:
+      SecretId: !Ref RDSInstanceSecret
+      TargetId: !Ref RDSInstance
+      TargetType: AWS::RDS::DBInstance
+      
+    #This secret has a dynamically generated secret password and username    
+  RDSInstanceSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: mysqlrdssingtel
+      Description: "This secret has a dynamically generated secret password and username."
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "mysqlrdssingtel"}'
+        GenerateStringKey: "password"
+        PasswordLength: 30
+        ExcludeCharacters: '"@/\'
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnet group for RDS"
+      SubnetIds:
+        - !ImportValue PrivateSubnet1
+        - !ImportValue PrivateSubnet2
+  DBEC2SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+     VpcId: !ImportValue VPC
+     GroupDescription: Database port access
+  DBEC2SecurityGroupIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !GetAtt [DBEC2SecurityGroup, GroupId]
+      IpProtocol: tcp
+      FromPort: "3306"
+      ToPort: "3306"
+      SourceSecurityGroupId: !Ref WebServerSecurityGroup
+      
+  rdsRoute53RecordSetGroup:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Join ["", [!Ref HostedZone, .]]
+      Comment: Zone apex alias targeted to myELB LoadBalancer.
+      RecordSets:
+        - Name: !Join [".", [!Ref SubDomain, !Ref HostedZone]]
+          Type: CNAME
+          TTL: '300' 
+          ResourceRecords: 
+             - !GetAtt RDSInstance.Endpoint.Address
+
+Outputs:
+  InstanceId:
+    Description: InstanceId of the newly created RDS Instance
+    Value: !Ref RDSInstance
+  RDS:
+    Description: "DNS of the RDS"
+    Value: !Ref rdsRoute53RecordSetGroup
